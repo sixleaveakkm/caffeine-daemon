@@ -2,28 +2,39 @@
 
 A small HTTP service for macOS that keeps your Mac awake while something is working.
 
-It holds a `caffeinate -dis` process for as long as at least one caller has an active
-hold. Holds are tracked by id, so several sessions can ask for wakefulness at once and
-the Mac only sleeps again once the last one is gone.
+It holds a `caffeinate -dis` process while at least one caller has an active hold. Holds
+are tracked by id, so several callers can overlap and the Mac sleeps only once the last is
+gone; each carries a ttl, so a caller that dies cannot pin it awake for good.
 
-It exists mainly for [Claude Code](https://claude.com/claude-code) hooks: Claude Code can
-be running in a container, but only the host can stop the host from sleeping. The daemon
-runs on the Mac, the hook posts to it over HTTP.
+`caffeinate` only works from inside its own logged-in session. Anything that can reach
+this daemon over HTTP can keep the Mac awake instead — a container, another machine, a
+script. That is what it was built for: [Claude Code](https://claude.com/claude-code) in a
+container, with a [ready-made hook script](#use-with-claude-code-hooks).
 
 ## Requirements
 
-- macOS (the daemon shells out to `caffeinate`)
-- Rust toolchain to build (`cargo`)
-- `jq` and `curl` if you use the Claude Code hook examples below
+The daemon runs on the Mac and needs:
+
+- macOS (it shells out to `caffeinate`)
+- a Rust toolchain to build it (`cargo`)
+
+The hook runs wherever Claude Code does — inside the container when Claude Code is
+containerised, on the Mac when it is not — and needs `python3` and `curl` there. Most
+container images ship both; on macOS `python3` comes with the Xcode Command Line Tools
+(`xcode-select --install`).
+
+`python3` turns Claude Code's hook JSON into the request body. Without it the hook still
+keeps the Mac awake, but every session shares a single hold called `claude-code`: `status`
+can no longer tell them apart, and the first session to stop releases it for all of them.
 
 ## Install
 
 ```sh
-git clone https://github.com/sixleaveakkm/caffeine-daemon
-cd caffeine-daemon
-cargo build --release
-install -m 755 target/release/caffeine-daemon /usr/local/bin/caffeine-daemon
+cargo install --git https://github.com/sixleaveakkm/caffeine-daemon
 ```
+
+Or `cargo install --path .` from a clone. Either puts `caffeine-daemon` in `~/.cargo/bin`,
+which `install-launchagent` then points the plist at.
 
 ## Configure
 
@@ -32,19 +43,20 @@ the values below are the defaults.
 
 ```toml
 # How long a hold survives without being refreshed.
-ttl  = "5m"
+ttl  = "10m"
 
 # Address to listen on. 0.0.0.0 so containers can reach it through
 # host.docker.internal; use 127.0.0.1 to accept host-local callers only.
 bind = "0.0.0.0:8787"
 
-# Shared secret. Unset, the API is open to anyone who can reach it.
+# Shared secret for POST /hook. Unset, the API is open to anyone who can
+# reach it; see "The api-key" below.
 # api-key = "a-long-random-string"
 ```
 
-When `api-key` is set, `POST /hook` must present it, either as an `api-key` header or as
-an `api-key` field in the JSON body. Anything else is answered `401 Unauthorized`.
-`GET /status` is never checked.
+Unknown keys are refused rather than ignored, so a typo — `api_key` for `api-key`, say —
+stops the daemon at startup instead of silently doing nothing. The file is read once, so
+edits need a restart.
 
 Run it in the foreground to check the setup:
 
@@ -52,12 +64,47 @@ Run it in the foreground to check the setup:
 caffeine-daemon
 ```
 
+## The api-key
+
+`bind = "0.0.0.0:8787"` is what lets a container reach the daemon, and it is also what
+lets everything else on the network reach it. Set `api-key` to close that off:
+
+```toml
+api-key = "a-long-random-string"   # openssl rand -hex 16
+```
+
+It guards `POST /hook` — the endpoint that changes something. A caller presents it either
+way round:
+
+```sh
+curl -H "api-key: $KEY" -d '{"id":"x","title":"x","event":"hold"}' http://127.0.0.1:8787/hook
+curl -d '{"id":"x","title":"x","event":"hold","api-key":"'"$KEY"'"}' http://127.0.0.1:8787/hook
+```
+
+Anything else is `401 Unauthorized`. An empty `api-key = ""` counts as unset, so it opens
+the API rather than locking every caller out.
+
+`GET /status` is never checked. It reports `api_key_required` instead, so a caller can
+tell a daemon that wants a key from one that is simply broken, without holding a key.
+
+The pieces that ship with the daemon pick the key up on their own:
+
+- `caffeine-daemon stop <id>` reads it from the same config file.
+- `caffeine-daemon print-script` bakes it into the hook script it prints, and
+  `CAFFEINE_API_KEY` in the environment overrides that.
+
+A hook with the wrong key is answered `401`, and — by design — still exits `0` and prints
+nothing, so an unauthorised session looks exactly like a working one from the inside. The
+symptom is the Mac sleeping and no hold in `status`. Check `caffeine-daemon status`: it
+prints `api-key: required` when the daemon wants one, and lists what is actually held.
+
 ## Commands
 
 ```sh
 caffeine-daemon                      # start the server
 caffeine-daemon status               # ask a running daemon what it is doing
 caffeine-daemon stop <id>            # end one hold now, without waiting for its ttl
+caffeine-daemon print-script         # print the Claude Code hook script
 caffeine-daemon install-launchagent  # write the launchd plist
 caffeine-daemon --help               # usage
 ```
@@ -106,7 +153,7 @@ caffeine-daemon install-launchagent
 
 ```
 wrote /Users/you/Library/LaunchAgents/local.caffeine-daemon.plist
-  program: /usr/local/bin/caffeine-daemon
+  program: /Users/you/.cargo/bin/caffeine-daemon
 
 next:
   launchctl bootout gui/501/local.caffeine-daemon 2>/dev/null
@@ -124,7 +171,27 @@ launchctl print gui/$(id -u)/local.caffeine-daemon
 
 Re-run `install-launchagent` after moving the binary. It rewrites the plist only when the
 contents would change, and refuses to overwrite a plist you have edited by hand unless you
-pass `--force`. Either way, `bootout` and `bootstrap` again to pick the change up.
+pass `--force`.
+
+Restarting it depends on what changed. launchd re-reads the plist only when you bootstrap,
+so a rewritten plist needs the longer form:
+
+```sh
+# config.toml edited, or the binary replaced where it stands
+launchctl kickstart -k gui/$(id -u)/local.caffeine-daemon
+
+# plist rewritten by install-launchagent
+launchctl bootout gui/$(id -u)/local.caffeine-daemon
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.caffeine-daemon.plist
+```
+
+`kickstart -k` stops the running copy and starts it again from the plist already loaded.
+Plain `launchctl stop` is not a restart here — with `KeepAlive` set, launchd starts it
+straight back up, which is also why killing the process by pid brings it back.
+
+Either way the restart drops every live hold, since holds live only in memory, and the
+`caffeinate` it was holding exits with it. The Mac can sleep until the next caller posts —
+for Claude Code, the next hook event.
 
 The plist it writes:
 
@@ -138,7 +205,7 @@ The plist it writes:
     <string>local.caffeine-daemon</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/caffeine-daemon</string>
+        <string>/Users/you/.cargo/bin/caffeine-daemon</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -277,10 +344,11 @@ call if that is a problem.
 
 ### From Docker
 
-When Claude Code runs in a container, keep `bind = "0.0.0.0:8787"`. The script already
-defaults to `host.docker.internal`, which resolves to the Mac on Docker Desktop and
-OrbStack, and it names the hold after the host-side project directory rather than the
-container's mount point. Verify from inside the container with:
+When Claude Code runs in a container, keep `bind = "0.0.0.0:8787"`. The script runs inside
+the container, so that is where `python3` and `curl` have to be. It already defaults to
+`host.docker.internal`, which resolves to the Mac on Docker Desktop and OrbStack, and it
+names the hold after the host-side project directory rather than the container's mount
+point. Verify from inside the container with:
 
 ```sh
 curl -sf http://host.docker.internal:8787/status
